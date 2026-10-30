@@ -146,13 +146,69 @@ pub fn iceoryx2_ffi(args: TokenStream, input: TokenStream) -> TokenStream {
                 unsafe { *self.value.as_option_mut() = Some(value) }
             }
 
+            #[inline(always)]
+            fn ffi_pool() -> (
+                *mut #struct_name,
+                &'static ::iceoryx2_bb_concurrency::atomic::AtomicU64,
+            ) {
+                #[repr(C)]
+                struct Pool {
+                    occupied: ::iceoryx2_bb_concurrency::atomic::AtomicU64,
+                    slots: ::core::cell::UnsafeCell<[::core::mem::MaybeUninit<#struct_name>; 64]>,
+                }
+                unsafe impl ::core::marker::Sync for Pool {}
+                static POOL: Pool = Pool {
+                    occupied: ::iceoryx2_bb_concurrency::atomic::AtomicU64::new(0),
+                    slots: ::core::cell::UnsafeCell::new(
+                        [const { ::core::mem::MaybeUninit::uninit() }; 64],
+                    ),
+                };
+                (
+                    unsafe { (*POOL.slots.get()).as_mut_ptr().cast::<#struct_name>() },
+                    &POOL.occupied,
+                )
+            }
+
             pub(super) fn alloc() -> *mut #struct_name {
+                let (base, occupied) = Self::ffi_pool();
+                let mut occ = occupied.load(::iceoryx2_bb_concurrency::atomic::Ordering::Relaxed);
+                while occ != u64::MAX {
+                    let idx = (!occ).trailing_zeros() as usize;
+                    let bit = 1u64 << idx;
+                    match occupied.compare_exchange_weak(
+                        occ,
+                        occ | bit,
+                        ::iceoryx2_bb_concurrency::atomic::Ordering::AcqRel,
+                        ::iceoryx2_bb_concurrency::atomic::Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return unsafe { base.add(idx) },
+                        Err(actual) => occ = actual,
+                    }
+                }
                 unsafe { ::alloc::alloc::alloc(::core::alloc::Layout::new::<#struct_name>()) as _ }
             }
 
             pub(super) fn dealloc(storage: *mut #struct_name) {
+                let (base, occupied) = Self::ffi_pool();
+                let elem_size = ::core::mem::size_of::<#struct_name>();
+                let base_addr = base as usize;
+                let addr = storage as usize;
+                if elem_size > 0 && addr >= base_addr {
+                    let offset = addr - base_addr;
+                    let idx = offset / elem_size;
+                    if idx < 64 && offset % elem_size == 0 {
+                        occupied.fetch_and(
+                            !(1u64 << idx),
+                            ::iceoryx2_bb_concurrency::atomic::Ordering::Release,
+                        );
+                        return;
+                    }
+                }
                 unsafe {
-                    ::alloc::alloc::dealloc(storage as _, ::core::alloc::Layout::new::<#struct_name>())
+                    ::alloc::alloc::dealloc(
+                        storage as _,
+                        ::core::alloc::Layout::new::<#struct_name>(),
+                    )
                 }
             }
         }

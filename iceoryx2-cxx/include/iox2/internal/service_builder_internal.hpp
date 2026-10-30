@@ -20,6 +20,7 @@
 #include "iox2/type_name.hpp"
 
 #include <cstdio>
+#include <string_view>
 #include <typeinfo>
 
 namespace iox2 {
@@ -79,6 +80,60 @@ using FromSliceWithoutInnerPayloadTypeNameMember =
                          && !HasPayloadTypeNameMember<typename Payload::ValueType>::value,
                      TypeName>;
 
+#if !defined(__cpp_rtti) && !defined(__GXX_RTTI)
+template <typename T>
+constexpr auto compiler_type_name() noexcept {
+    constexpr std::string_view signature = __PRETTY_FUNCTION__;
+    constexpr auto marker = signature.find("T = ");
+    constexpr auto end = signature.rfind(']');
+    static_assert(marker != std::string_view::npos && end != std::string_view::npos,
+                  "Unsupported compiler type signature");
+    return signature.substr(marker + 4, end - marker - 4);
+}
+
+struct RttiFreeTypeName {
+    char bytes[TypeName::capacity()] {};
+};
+
+template <typename T>
+constexpr auto make_rtti_free_type_name() noexcept -> RttiFreeTypeName {
+    constexpr auto name = compiler_type_name<T>();
+    constexpr std::string_view prefix = "__cxx__abi__";
+    constexpr std::string_view hex = "0123456789abcdef";
+    constexpr auto limit = TypeName::capacity() - 1;
+    static_assert(limit > prefix.size() + 17, "TypeName capacity cannot hold the type fingerprint");
+    RttiFreeTypeName result;
+    size_t size = 0;
+    for (const auto c : prefix)
+        result.bytes[size++] = c;
+    uint64_t hash = 14695981039346656037ULL;
+    for (const auto c : name) {
+        const auto byte = static_cast<unsigned char>(c);
+        hash = (hash ^ byte) * 1099511628211ULL;
+    }
+    // Keep the full-type fingerprint when truncating and escape non-ASCII bytes.
+    // Compiler-derived names are build-local; portable schemas must provide an explicit name.
+    for (const auto c : name) {
+        const auto byte = static_cast<unsigned char>(c);
+        if (byte >= 0x20 && byte <= 0x7e && c != '"' && c != '\\') {
+            if (size == limit - 17)
+                break;
+            result.bytes[size++] = c;
+        } else {
+            if (size + 4 > limit - 17)
+                break;
+            result.bytes[size++] = '_';
+            result.bytes[size++] = 'x';
+            result.bytes[size++] = hex[byte >> 4];
+            result.bytes[size++] = hex[byte & 0xf];
+        }
+    }
+    result.bytes[size++] = '_';
+    for (size_t i = 0; i < 16; ++i)
+        result.bytes[size++] = hex[(hash >> ((15 - i) * 4)) & 0xf];
+    return result;
+}
+#endif
 template <typename PayloadType>
 auto get_type_name_impl() -> internal::FromPayloadTypeNameSpecialization<PayloadType> {
     static_assert(!HasPayloadTypeNameMember<PayloadType>::value,
@@ -159,6 +214,7 @@ auto get_type_name_impl() -> internal::FromNonSlice<PayloadType> {
         return *TypeName::from_utf8("f64");
     }
 
+#if defined(__cpp_rtti) || defined(__GXX_RTTI)
     // std::array is not available in this safety-critical context
     // NOLINTNEXTLINE
     char type_name[TypeName::capacity()] { 0 };
@@ -168,8 +224,11 @@ auto get_type_name_impl() -> internal::FromNonSlice<PayloadType> {
              TypeName::capacity(),
              "__cxx__abi__%s",
              typeid(typename PayloadInfo<PayloadType>::ValueType).name());
-
     return *TypeName::from_utf8_null_terminated_unchecked(&type_name[0]);
+#else
+    constexpr auto fallback = make_rtti_free_type_name<typename PayloadInfo<PayloadType>::ValueType>();
+    return *TypeName::from_utf8_null_terminated_unchecked(fallback.bytes);
+#endif
 }
 // NOLINTEND(readability-function-size)
 
